@@ -1,51 +1,29 @@
-# C++ compiler
-CXX = g++
+# Compiler settings
+CXX      = g++
+CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -D_WIN32_WINNT=0x0601 -m32 -Wno-unknown-pragmas \
+           -static-libgcc -static-libstdc++
 
-# Compiler flags:
-# -std=c++17     - Use the C++17 standard (c++14 or c++11 are also fine)
-# -Wall          - Enable all warnings (recommended)
-# -Wextra        - Enable extra warnings
-# -O2            - Optimization level for release builds
-# -g             - Include debugging information in the executable
-CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -g
+# OpenSSL Include path (from your structure)
+OPENSSL_INC = -I"C:/Users/PC/openssl/include"
 
-# Linker flags:
-# -lssl          - Link against the SSL library
-# -lcrypto       - Link against the crypto library (part of OpenSSL)
-LDFLAGS = -lssl -lcrypto
+# Direct DLL Linking (The one that worked!)
+# Point to the DLLs in your openssl/bin folder if they exist there, 
+# OR copy libssl-3.dll and libcrypto-3.dll to your project folder and link like this:
+LIB_SSL     = libssl-3.dll
+LIB_CRYPTO  = libcrypto-3.dll
 
-# The final executable name
-TARGET = pinoader
-
-# List of all source files (.cpp)
+TARGET  = pinoader.exe
 SOURCES = main.cpp http_client.cpp parser.cpp
-
-# Automatically generate the list of object files (.o) from the sources
 OBJECTS = $(SOURCES:.cpp=.o)
 
-# --- Build Rules ---
-
-# The default target: 'all'. This is executed when you just run 'make'
-# It depends on the final target file.
 all: $(TARGET)
 
-# The linking rule. Creates the final executable from the object files.
-# It depends on all object files.
 $(TARGET): $(OBJECTS)
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(OBJECTS) $(LDFLAGS)
-	@echo "Build of '$@' finished successfully."
+    # Linking against local DLLs
+	$(CXX) $(CXXFLAGS) -o $(TARGET) $(OBJECTS) $(LIB_SSL) $(LIB_CRYPTO) -lws2_32 -lgdi32 -lcrypt32
 
-# Pattern rule for compilation.
-# It tells make how to create a .o file from a corresponding .cpp file.
-# $@ is an automatic variable for the target name (e.g., main.o)
-# $< is an automatic variable for the first dependency's name (e.g., main.cpp)
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) $(CXXFLAGS) $(OPENSSL_INC) -c -o $@ $<
 
-# The 'clean' target. Removes all generated files.
 clean:
 	rm -f $(OBJECTS) $(TARGET)
-	@echo "Cleanup finished."
-
-# Declare targets that are not actual files.
-.PHONY: all clean
