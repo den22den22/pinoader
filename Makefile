@@ -1,29 +1,38 @@
 # Compiler settings
-CXX      = g++
-CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -D_WIN32_WINNT=0x0601 -m32 -Wno-unknown-pragmas \
-           -static-libgcc -static-libstdc++
+CXX = g++
 
-# OpenSSL Include path (from your structure)
-OPENSSL_INC = -I"C:/Users/PC/openssl/include"
+# Compiler Flags:
+# -std=c++17     : Standard version
+# -O2            : Optimization
+# -static        : VITAL! Forces static linking of ALL libraries
+# -D_WIN32_WINNT : Targets Windows 7 and newer
+CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -D_WIN32_WINNT=0x0601 -static
 
-# Direct DLL Linking (The one that worked!)
-# Point to the DLLs in your openssl/bin folder if they exist there, 
-# OR copy libssl-3.dll and libcrypto-3.dll to your project folder and link like this:
-LIB_SSL     = libssl-3.dll
-LIB_CRYPTO  = libcrypto-3.dll
+# Linker Flags:
+# MSYS2 finds libraries automatically.
+LDFLAGS = -lssl -lcrypto -lws2_32 -lgdi32 -lcrypt32 -luser32 -ladvapi32
 
+# Project details
 TARGET  = pinoader.exe
 SOURCES = main.cpp http_client.cpp parser.cpp
 OBJECTS = $(SOURCES:.cpp=.o)
 
+# --- Build Rules ---
+
 all: $(TARGET)
 
 $(TARGET): $(OBJECTS)
-    # Linking against local DLLs
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(OBJECTS) $(LIB_SSL) $(LIB_CRYPTO) -lws2_32 -lgdi32 -lcrypt32
+$(CXX) $(CXXFLAGS) -o $(TARGET) $(OBJECTS) $(LDFLAGS)
+@echo "Build successful! Run 'make strip' to reduce file size."
 
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) $(OPENSSL_INC) -c -o $@ $<
+$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+strip: $(TARGET)
+strip -s $(TARGET)
+@echo "Executable stripped."
 
 clean:
-	rm -f $(OBJECTS) $(TARGET)
+rm -f $(OBJECTS) $(TARGET)
+
+.PHONY: all clean strip
