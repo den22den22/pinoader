@@ -7,10 +7,8 @@
 #include "http_client.h"
 #include "logger.h"
 
-// Define the global variable declared in logger.h
 LogLevel g_log_level = LogLevel::NORMAL;
 
-// Function to print the help message
 void print_help(const char* program_name) {
     std::cout << "pinoader - A utility for downloading videos from Pinterest." << std::endl;
     std::cout << std::endl;
@@ -67,12 +65,11 @@ int main(int argc, char* argv[]) {
     std::string custom_filename;
     bool download_thumbnail = false;
 
-    // A new, more robust argument parser
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
             print_help(argv[0]);
-            return 0; // Successful exit after showing help
+            return 0;
         } else if (arg == "--debug") {
             g_log_level = LogLevel::DEBUG;
         } else if (arg == "--clear") {
@@ -132,7 +129,6 @@ int main(int argc, char* argv[]) {
     log_debug("[pinterest] Final URL: " + final_url);
     log_debug("[parser] Received " + std::to_string(html_content.length()) + " bytes of HTML. Parsing for media URL.");
     
-    // Logic for downloading the thumbnail
     if (download_thumbnail) {
         std::string thumbnail_url = find_thumbnail_url(html_content);
         if (thumbnail_url.empty()) {
