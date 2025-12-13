@@ -5,40 +5,29 @@
 #include <fstream>
 #include <algorithm>
 #include <random>
+#include <cstring>
+#include <map>
+#include <memory>
 #include <iostream>
 
-// Windows Headers
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 
-// OpenSSL Headers
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-// Link only basic Ws2_32 here, others via Makefile
 #pragma comment(lib, "Ws2_32.lib")
 
 const std::vector<std::string> USER_AGENTS = {
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0"
 };
 
-std::string get_random_user_agent() {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, USER_AGENTS.size() - 1);
-    return USER_AGENTS[dis(gen)];
-}
-
-// Initialization for Winsock ONLY.
-// OpenSSL 1.1+ and 3.x initialize automatically.
 struct SystemInitializer {
     SystemInitializer() {
-        // Init Winsock
         WSADATA wsaData;
         if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-            std::cerr << "WSAStartup failed." << std::endl;
             exit(1);
         }
     }
@@ -46,7 +35,233 @@ struct SystemInitializer {
         WSACleanup();
     }
 };
-SystemInitializer sys_initializer;
+static SystemInitializer sys_initializer;
+
+std::string get_random_user_agent() {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<> dis(0, USER_AGENTS.size() - 1);
+    return USER_AGENTS[dis(gen)];
+}
+
+struct Connection {
+    SOCKET socket_fd = INVALID_SOCKET;
+    SSL* ssl = nullptr;
+    std::string host;
+    int port = 0;
+    bool is_closed = false;
+
+    ~Connection() { close_conn(); }
+
+    void close_conn() {
+        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); ssl = nullptr; }
+        if (socket_fd != INVALID_SOCKET) { closesocket(socket_fd); socket_fd = INVALID_SOCKET; }
+        is_closed = true;
+    }
+};
+
+struct GlobalState {
+    SSL_CTX* ssl_ctx = nullptr;
+    std::map<std::string, std::unique_ptr<Connection>> pool;
+    std::map<std::string, std::string> dns_cache;
+    std::map<std::string, SSL_SESSION*> session_cache;
+
+    GlobalState() {
+        ssl_ctx = SSL_CTX_new(TLS_client_method());
+        if (ssl_ctx) {
+            SSL_CTX_set_default_verify_paths(ssl_ctx);
+            SSL_CTX_set_session_cache_mode(ssl_ctx, SSL_SESS_CACHE_CLIENT);
+            SSL_CTX_set_mode(ssl_ctx, SSL_MODE_RELEASE_BUFFERS); 
+        }
+    }
+
+    ~GlobalState() {
+        pool.clear();
+        for (auto& kv : session_cache) SSL_SESSION_free(kv.second);
+        if (ssl_ctx) SSL_CTX_free(ssl_ctx);
+    }
+
+    Connection* get_connection(const std::string& host, int port, bool use_ssl);
+    void save_session(Connection* conn);
+};
+
+static GlobalState g_state;
+
+struct BufferedStream {
+    Connection* conn;
+    char buffer[16384];
+    int pos = 0;
+    int end = 0;
+    bool error = false;
+
+    BufferedStream(Connection* c) : conn(c) {}
+
+    int fill() {
+        if (pos < end) {
+            memmove(buffer, buffer + pos, end - pos);
+            end -= pos;
+        } else {
+            end = 0;
+        }
+        pos = 0;
+
+        int r = 0;
+        if (conn->ssl) {
+            r = SSL_read(conn->ssl, buffer + end, sizeof(buffer) - end);
+        } else {
+            r = recv(conn->socket_fd, buffer + end, sizeof(buffer) - end, 0);
+        }
+
+        if (r <= 0) {
+            error = true;
+            conn->close_conn();
+        } else {
+            end += r;
+        }
+        return r;
+    }
+
+    std::string read_line() {
+        std::string line;
+        while (!error) {
+            if (pos >= end) if (fill() <= 0) break;
+            
+            char* newline = (char*)memchr(buffer + pos, '\n', end - pos);
+            if (newline) {
+                int len = (int)(newline - (buffer + pos)) + 1;
+                line.append(buffer + pos, len);
+                pos += len;
+                return line;
+            }
+            line.append(buffer + pos, end - pos);
+            pos = end;
+        }
+        return line;
+    }
+
+    void read_exact(std::string& out, long n) {
+        size_t target = out.size() + n;
+        out.reserve(target);
+        while (n > 0 && !error) {
+            if (pos >= end) if (fill() <= 0) break;
+            
+            int avail = end - pos;
+            int to_copy = (avail < n) ? avail : (int)n;
+            out.append(buffer + pos, to_copy);
+            pos += to_copy;
+            n -= to_copy;
+        }
+    }
+
+    bool read_to_file(std::ofstream& outfile) {
+        if (pos < end) {
+            outfile.write(buffer + pos, end - pos);
+            pos = end;
+        }
+        while (true) {
+            int r = (conn->ssl) ? SSL_read(conn->ssl, buffer, sizeof(buffer)) : recv(conn->socket_fd, buffer, sizeof(buffer), 0);
+            if (r <= 0) break;
+            outfile.write(buffer, r);
+        }
+        return true;
+    }
+};
+
+void GlobalState::save_session(Connection* conn) {
+    if (!conn || !conn->ssl) return;
+    SSL_SESSION* sess = SSL_get1_session(conn->ssl);
+    if (sess) {
+        if (session_cache.count(conn->host)) SSL_SESSION_free(session_cache[conn->host]);
+        session_cache[conn->host] = sess;
+    }
+}
+
+Connection* GlobalState::get_connection(const std::string& host, int port, bool use_ssl) {
+    std::string key = host + ":" + std::to_string(port);
+    
+    if (pool.count(key)) {
+        Connection* c = pool[key].get();
+        if (!c->is_closed) {
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(c->socket_fd, &readfds);
+            timeval tv = {0, 0};
+            int ret = select(0, &readfds, NULL, NULL, &tv);
+            
+            if (ret > 0) {
+                char buf[1];
+                int r = recv(c->socket_fd, buf, 1, MSG_PEEK);
+                if (r <= 0) {
+                    c->close_conn();
+                }
+            }
+            
+            if (!c->is_closed) return c;
+        }
+        pool.erase(key);
+    }
+
+    auto conn = std::make_unique<Connection>();
+    conn->host = host;
+    conn->port = port;
+
+    std::string ip;
+    if (dns_cache.count(host)) {
+        ip = dns_cache[host];
+    } else {
+        addrinfo hints = {}, *addrs;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &addrs) != 0) return nullptr;
+        
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &((sockaddr_in*)addrs->ai_addr)->sin_addr, ip_str, INET_ADDRSTRLEN);
+        ip = std::string(ip_str);
+        dns_cache[host] = ip;
+        freeaddrinfo(addrs);
+    }
+
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip.c_str(), &server_addr.sin_addr);
+
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET) return nullptr;
+
+    BOOL flag = TRUE;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(BOOL));
+    
+    DWORD timeout = 10000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
+        closesocket(sock); return nullptr;
+    }
+
+    conn->socket_fd = sock;
+
+    if (use_ssl) {
+        conn->ssl = SSL_new(ssl_ctx);
+        SSL_set_fd(conn->ssl, (int)sock);
+        SSL_set_tlsext_host_name(conn->ssl, host.c_str());
+        
+        if (session_cache.count(host)) {
+            SSL_set_session(conn->ssl, session_cache[host]);
+        }
+
+        if (SSL_connect(conn->ssl) <= 0) {
+            conn->close_conn();
+            return nullptr;
+        }
+        save_session(conn.get());
+    }
+
+    Connection* ptr = conn.get();
+    pool[key] = std::move(conn);
+    return ptr;
+}
 
 bool parse_url(const std::string& url, std::string& protocol, std::string& host, std::string& path, int& port) {
     size_t protocol_pos = url.find("://");
@@ -71,102 +286,74 @@ std::string to_lower(std::string s) {
 }
 
 HttpResponse perform_request(const std::string& protocol, const std::string& host, const std::string& path, int port) {
-    addrinfo hints = {}, *addrs;
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
     HttpResponse response;
+    bool use_ssl = (protocol == "https");
 
-    log_debug("[http] Resolving " + host);
-    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &addrs) != 0) {
-        return response;
-    }
+    for (int retry = 0; retry < 2; ++retry) {
+        Connection* conn = g_state.get_connection(host, port, use_ssl);
+        if (!conn) return response;
 
-    SOCKET socket_fd = INVALID_SOCKET;
-    for (addrinfo* rp = addrs; rp != nullptr; rp = rp->ai_next) {
-        socket_fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (socket_fd == INVALID_SOCKET) continue;
-        if (connect(socket_fd, rp->ai_addr, (int)rp->ai_addrlen) != SOCKET_ERROR) break;
-        closesocket(socket_fd);
-        socket_fd = INVALID_SOCKET;
-    }
-    freeaddrinfo(addrs);
-
-    if (socket_fd == INVALID_SOCKET) return response;
-
-    SSL_CTX* ssl_ctx = nullptr;
-    SSL* ssl = nullptr;
-    bool is_https = (protocol == "https");
-
-    if (is_https) {
-        // Modern OpenSSL uses TLS_client_method
-        ssl_ctx = SSL_CTX_new(TLS_client_method());
-        if (!ssl_ctx) {
-            closesocket(socket_fd);
-            return response;
-        }
-
-        ssl = SSL_new(ssl_ctx);
-        SSL_set_fd(ssl, (int)socket_fd);
+        std::string req = "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nUser-Agent: " + get_random_user_agent() + "\r\nConnection: keep-alive\r\n\r\n";
         
-        // SNI (Server Name Indication) is mandatory for modern web
-        SSL_set_tlsext_host_name(ssl, host.c_str());
-
-        if (SSL_connect(ssl) <= 0) {
-            log_debug("[http] SSL handshake failed.");
-            SSL_free(ssl);
-            SSL_CTX_free(ssl_ctx);
-            closesocket(socket_fd);
-            return response;
+        int sent = (conn->ssl) ? SSL_write(conn->ssl, req.c_str(), (int)req.length()) : send(conn->socket_fd, req.c_str(), (int)req.length(), 0);
+        if (sent <= 0) {
+            conn->close_conn();
+            continue; 
         }
-    }
 
-    std::stringstream request_stream;
-    request_stream << "GET " << path << " HTTP/1.1\r\n";
-    request_stream << "Host: " << host << "\r\n";
-    request_stream << "User-Agent: " << get_random_user_agent() << "\r\n";
-    request_stream << "Connection: close\r\n\r\n";
-    std::string request = request_stream.str();
-
-    if (is_https) SSL_write(ssl, request.c_str(), request.length());
-    else send(socket_fd, request.c_str(), (int)request.length(), 0);
-
-    std::string full_response;
-    char buffer[8192];
-    int bytes_received;
-
-    if (is_https) {
-        while ((bytes_received = SSL_read(ssl, buffer, sizeof(buffer))) > 0) {
-            full_response.append(buffer, bytes_received);
+        BufferedStream stream(conn);
+        std::string line = stream.read_line();
+        if (line.empty()) {
+            conn->close_conn();
+            continue;
         }
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        SSL_CTX_free(ssl_ctx);
-    } else {
-        while ((bytes_received = recv(socket_fd, buffer, sizeof(buffer), 0)) > 0) {
-            full_response.append(buffer, bytes_received);
+
+        sscanf(line.c_str(), "HTTP/%*f %d", &response.status_code);
+
+        long content_len = -1;
+        bool chunked = false;
+        bool connection_close = false;
+
+        while (true) {
+            line = stream.read_line();
+            if (line == "\r\n" || line == "\n" || line.empty()) break;
+            
+            auto colon = line.find(':');
+            if (colon != std::string::npos) {
+                std::string key = to_lower(line.substr(0, colon));
+                std::string val = line.substr(colon + 2);
+                while (!val.empty() && (val.back() == '\r' || val.back() == '\n')) val.pop_back();
+                response.headers[key] = val;
+
+                if (key == "content-length") content_len = std::stol(val);
+                if (key == "transfer-encoding" && val.find("chunked") != std::string::npos) chunked = true;
+                if (key == "connection" && val.find("close") != std::string::npos) connection_close = true;
+            }
         }
-    }
-    closesocket(socket_fd);
 
-    size_t headers_end = full_response.find("\r\n\r\n");
-    if (headers_end == std::string::npos) return response;
-
-    std::string headers_part = full_response.substr(0, headers_end);
-    response.body = full_response.substr(headers_end + 4);
-
-    std::stringstream headers_ss(headers_part);
-    std::string line;
-    std::getline(headers_ss, line);
-    sscanf(line.c_str(), "HTTP/%*f %d", &response.status_code);
-
-    while(std::getline(headers_ss, line) && line != "\r") {
-        auto colon_pos = line.find(':');
-        if(colon_pos != std::string::npos) {
-            auto key = to_lower(line.substr(0, colon_pos));
-            auto value = line.substr(colon_pos + 2);
-            value.erase(value.find_last_not_of("\r\n") + 1);
-            response.headers[key] = value;
+        if (content_len >= 0) {
+            stream.read_exact(response.body, content_len);
+        } else if (chunked) {
+            while (true) {
+                std::string size_line = stream.read_line();
+                long chunk_size = 0;
+                try { chunk_size = std::stol(size_line, nullptr, 16); } catch(...) { break; }
+                if (chunk_size == 0) { stream.read_line(); break; } 
+                stream.read_exact(response.body, chunk_size);
+                stream.read_line(); 
+            }
+        } else {
+             while (true) {
+                char tmp[4096];
+                int r = (conn->ssl) ? SSL_read(conn->ssl, tmp, sizeof(tmp)) : recv(conn->socket_fd, tmp, sizeof(tmp), 0);
+                if (r <= 0) break;
+                response.body.append(tmp, r);
+             }
+             connection_close = true;
         }
+
+        if (connection_close) conn->close_conn();
+        return response;
     }
     return response;
 }
@@ -179,15 +366,16 @@ std::string fetch_url(const std::string& initial_url, std::string& final_url, in
         int port;
         if (!parse_url(current_url, protocol, host, path, port)) return "";
 
-        log_debug("[http] Requesting: " + current_url);
+        log_debug("[http] Fetching: " + current_url);
         HttpResponse res = perform_request(protocol, host, path, port);
 
         if (res.status_code >= 300 && res.status_code < 400 && res.headers.count("location")) {
-            current_url = res.headers["location"];
-            if (current_url.find("http") != 0) {
-                 if (current_url[0] == '/') current_url = protocol + "://" + host + current_url;
-                 else current_url = protocol + "://" + host + "/" + current_url;
+            std::string loc = res.headers["location"];
+            if (loc.find("http") != 0) {
+                 if (loc.front() == '/') loc = protocol + "://" + host + loc;
+                 else loc = protocol + "://" + host + "/" + loc;
             }
+            current_url = loc;
         } else if (res.status_code == 200) {
             return res.body;
         } else {
@@ -198,60 +386,29 @@ std::string fetch_url(const std::string& initial_url, std::string& final_url, in
 }
 
 bool download_file(const std::string& url, const std::string& output_path) {
-    log_normal("[downloader] Saving to: " + output_path);
+    log_normal("[downloader] Destination: " + output_path);
     std::string protocol, host, path;
     int port;
     if (!parse_url(url, protocol, host, path, port) || protocol != "https") return false;
 
-    addrinfo hints = {}, *addrs;
-    hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &addrs) != 0) return false;
+    Connection* conn = g_state.get_connection(host, port, true);
+    if (!conn) return false;
 
-    SOCKET socket_fd = INVALID_SOCKET;
-    for (addrinfo* rp = addrs; rp != nullptr; rp = rp->ai_next) {
-        socket_fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (socket_fd == INVALID_SOCKET) continue;
-        if (connect(socket_fd, rp->ai_addr, (int)rp->ai_addrlen) != SOCKET_ERROR) break;
-        closesocket(socket_fd); socket_fd = INVALID_SOCKET;
+    std::string req = "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\nUser-Agent: " + get_random_user_agent() + "\r\n\r\n";
+    SSL_write(conn->ssl, req.c_str(), (int)req.length());
+
+    BufferedStream stream(conn);
+    std::string line = stream.read_line();
+    if (line.empty()) return false;
+
+    while (true) {
+        line = stream.read_line();
+        if (line == "\r\n" || line == "\n" || line.empty()) break;
     }
-    freeaddrinfo(addrs);
-    if (socket_fd == INVALID_SOCKET) return false;
 
-    // TLS_client_method for modern OpenSSL
-    SSL_CTX* ssl_ctx = SSL_CTX_new(TLS_client_method());
-    SSL* ssl = SSL_new(ssl_ctx);
-    SSL_set_fd(ssl, (int)socket_fd);
+    std::ofstream outfile(output_path, std::ios::binary);
+    stream.read_to_file(outfile);
     
-    // SNI
-    SSL_set_tlsext_host_name(ssl, host.c_str());
-
-    if (SSL_connect(ssl) <= 0) {
-        SSL_free(ssl); SSL_CTX_free(ssl_ctx); closesocket(socket_fd);
-        return false;
-    }
-
-    std::string request = "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\nUser-Agent: " + get_random_user_agent() + "\r\n\r\n";
-    SSL_write(ssl, request.c_str(), request.length());
-
-    char buffer[8192];
-    int bytes_received = SSL_read(ssl, buffer, sizeof(buffer));
-    if (bytes_received <= 0) {
-        SSL_free(ssl); SSL_CTX_free(ssl_ctx); closesocket(socket_fd); return false;
-    }
-
-    std::string response_str(buffer, bytes_received);
-    size_t headers_end = response_str.find("\r\n\r\n");
-    if (headers_end == std::string::npos) return false;
-
-    std::ofstream output_file(output_path, std::ios::binary);
-    size_t body_start = headers_end + 4;
-    output_file.write(buffer + body_start, bytes_received - body_start);
-
-    while ((bytes_received = SSL_read(ssl, buffer, sizeof(buffer))) > 0) {
-        output_file.write(buffer, bytes_received);
-    }
-
-    output_file.close();
-    SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ssl_ctx); closesocket(socket_fd);
+    conn->close_conn();
     return true;
 }
